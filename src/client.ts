@@ -39,8 +39,8 @@ import { RouteResponse } from "./responses/route_response"
 import { StreamStatsResponse } from "./responses/stream_stats_response"
 import { SubscribeResponse } from "./responses/subscribe_response"
 import { UnsubscribeResponse } from "./responses/unsubscribe_response"
-import { SuperStreamConsumer, SuperStreamConsumerFunc } from "./super_stream_consumer"
-import { MessageKeyExtractorFunction, SuperStreamPublisher } from "./super_stream_publisher"
+import { SuperConsumer, SuperStreamConsumer, SuperStreamConsumerFunc } from "./super_stream_consumer"
+import { MessageKeyExtractorFunction, SuperPublisher, SuperStreamPublisher } from "./super_stream_publisher"
 import { DEFAULT_FRAME_MAX, REQUIRED_MANAGEMENT_VERSION, ResponseCode, sample, wait } from "./util"
 import { ConsumerCreditPolicy, CreditRequestWrapper, defaultCreditPolicy } from "./consumer_credit_policy"
 import { PublishConfirmResponse } from "./responses/publish_confirm_response"
@@ -386,9 +386,16 @@ export class Client {
    * @param handle - Message handler function that processes received messages
    */
   public async declareSuperStreamConsumer(
-    { superStream, offset, consumerRef, creditPolicy, filter }: DeclareSuperStreamConsumerParams,
+    {
+      superStream,
+      offset,
+      consumerRef,
+      creditPolicy,
+      filter,
+      consumerUpdateListener,
+    }: DeclareSuperStreamConsumerParams,
     handle: SuperStreamConsumerFunc
-  ): Promise<SuperStreamConsumer> {
+  ): Promise<SuperConsumer> {
     const partitions = await this.queryPartitions({ superStream })
     return SuperStreamConsumer.create(handle, {
       superStream,
@@ -398,6 +405,7 @@ export class Client {
       partitions,
       creditPolicy,
       filter,
+      consumerUpdateListener,
     })
   }
 
@@ -405,12 +413,12 @@ export class Client {
    * Declare a publisher for a super stream
    *
    * @param params - Super stream publisher configuration, including optional filter for server-side message filtering on each partition publisher
-   * @param keyExtractor - Function to extract the routing key from a message
+   * @param keyExtractor - Optional function to extract the routing key from a message (not required when routingKey sent with the message)
    */
   public async declareSuperStreamPublisher(
-    { superStream, publisherRef, routingStrategy, filter }: DeclareSuperStreamPublisherParams,
-    keyExtractor: MessageKeyExtractorFunction
-  ): Promise<SuperStreamPublisher> {
+    { superStream, publisherRef, routingStrategy, filter, routingCacheSize }: DeclareSuperStreamPublisherParams,
+    keyExtractor?: MessageKeyExtractorFunction
+  ): Promise<SuperPublisher> {
     return SuperStreamPublisher.create({
       locator: this,
       superStream: superStream,
@@ -418,6 +426,7 @@ export class Client {
       publisherRef,
       routingStrategy,
       filter,
+      routingCacheSize,
     })
   }
 
@@ -1032,6 +1041,12 @@ export interface DeclareSuperStreamPublisherParams {
   publisherRef?: string
   routingStrategy?: RoutingStrategy
   filter?: FilterFunc
+
+  /**
+   * Maximum number of routing key -> partition entries kept in memory when using the "key" routing strategy.
+   * Least recently used entries are evicted first. Defaults to 10000.
+   */
+  routingCacheSize?: number
 }
 
 /**
@@ -1072,6 +1087,7 @@ export interface DeclareSuperStreamConsumerParams {
   offset?: Offset
   creditPolicy?: ConsumerCreditPolicy
   filter?: ConsumerFilter
+  consumerUpdateListener?: ConsumerUpdateListener
 }
 
 export interface SubscribeParams {
