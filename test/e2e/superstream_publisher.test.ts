@@ -256,10 +256,6 @@ describe("super stream publisher", () => {
       await publisher.send(Buffer.from("hello"), { routingKey: `hello${i}` })
     }
 
-<<<<<<< HEAD
-=======
-    // same distribution as the hashing test, where the same keys come from the extractor
->>>>>>> a00f93e (pass-routing-key-to-send)
     await eventually(async () => {
       expect((await rabbit.getQueueInfo(`${superStreamName}-0`)).messages).to.eql(9)
       expect((await rabbit.getQueueInfo(`${superStreamName}-1`)).messages).to.eql(7)
@@ -272,10 +268,6 @@ describe("super stream publisher", () => {
     await client.declareSuperStreamConsumer({ superStream: superStreamName }, (msg) => {
       messages.push(msg)
     })
-<<<<<<< HEAD
-=======
-    // the extractor would make the send throw, as the key does not exist
->>>>>>> a00f93e (pass-routing-key-to-send)
     const publisher = await client.declareSuperStreamPublisher(
       { superStream: superStreamName, routingStrategy: "key" },
       (_) => "non-existent"
@@ -300,7 +292,6 @@ describe("super stream publisher", () => {
     )
   })
 
-<<<<<<< HEAD
   it("send with an empty string routingKey throws and does not fall back to the key extractor", async () => {
     const publisher = await client.declareSuperStreamPublisher(
       { superStream: superStreamName },
@@ -390,8 +381,6 @@ describe("super stream publisher", () => {
     )
   })
 
-=======
->>>>>>> a00f93e (pass-routing-key-to-send)
   it("sendSubEntries uses the routingKey from each message - no key extractor needed", async () => {
     const publisher = await client.declareSuperStreamPublisher({ superStream: superStreamName })
     const messages = range(20).map((_, i) => ({ content: Buffer.from("hello"), routingKey: `hello${i}` }))
@@ -410,10 +399,6 @@ describe("super stream publisher", () => {
     await client.declareSuperStreamConsumer({ superStream: superStreamName }, (m: Message) => {
       receivedMessages.push(m)
     })
-<<<<<<< HEAD
-=======
-    // the extractor would make the send throw, as the key does not exist
->>>>>>> a00f93e (pass-routing-key-to-send)
     const publisher = await client.declareSuperStreamPublisher(
       { superStream: superStreamName, routingStrategy: "key" },
       (_) => "non-existent"
