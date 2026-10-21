@@ -30,8 +30,8 @@ export type MessageWithOptions = Message & SuperStreamMessageOptions
 
 export interface SuperPublisher {
   close(): Promise<void>
-  send(message: Buffer, opts: MessageOptions): Promise<SendResult>
-  basicSend(publishingId: bigint, message: Buffer, opts: MessageOptions): Promise<SendResult>
+  send(message: Buffer, opts: SuperStreamMessageOptions): Promise<SendResult>
+  basicSend(publishingId: bigint, message: Buffer, opts: SuperStreamMessageOptions): Promise<SendResult>
   sendSubEntries(messages: MessageWithOptions[], compressionType?: CompressionType): Promise<void>
   getLastPublishingId(): Promise<bigint>
 
