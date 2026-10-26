@@ -1,4 +1,4 @@
-import { Client, RoutingStrategy } from "./client"
+import { Client, ConnectionClosedListener, RoutingStrategy } from "./client"
 import { CompressionType } from "./compression"
 import { murmur32 } from "./hash/murmur32"
 import { LruCache } from "./lru_cache"
@@ -17,6 +17,7 @@ type SuperStreamPublisherParams = {
   keyExtractor?: MessageKeyExtractorFunction
   filter?: FilterFunc
   routingCacheSize?: number
+  connectionClosedListener?: ConnectionClosedListener
 }
 
 export type SuperStreamMessageOptions = MessageOptions & {
@@ -48,6 +49,7 @@ export class SuperStreamPublisher implements SuperPublisher {
   private routingStrategy: RoutingStrategy
   private routingCache: LruCache<string, string>
   private filter?: FilterFunc
+  private connectionClosedListener?: ConnectionClosedListener
 
   private constructor(params: SuperStreamPublisherParams) {
     this.locator = params.locator
@@ -56,6 +58,7 @@ export class SuperStreamPublisher implements SuperPublisher {
     this.routingStrategy = params.routingStrategy ?? "hash"
     this.keyExtractor = params.keyExtractor ?? (() => undefined)
     this.filter = params.filter
+    this.connectionClosedListener = params.connectionClosedListener
     this.routingCache = new LruCache(params.routingCacheSize ?? DEFAULT_ROUTING_CACHE_SIZE)
   }
 
@@ -159,8 +162,18 @@ export class SuperStreamPublisher implements SuperPublisher {
   }
 
   private async initPublisher(partition: string): Promise<Publisher> {
-    const publisher = await this.locator.declarePublisher(
-      { stream: partition, publisherRef: this.publisherRef },
+    const publisher: Publisher = await this.locator.declarePublisher(
+      {
+        stream: partition,
+        publisherRef: this.publisherRef,
+        connectionClosedListener: (hadError) => {
+          // the publisher is dead: forget it so the next send declares a fresh one
+          if (this.publishers.get(partition) === publisher) {
+            this.publishers.delete(partition)
+          }
+          this.connectionClosedListener?.(hadError)
+        },
+      },
       this.filter
     )
     this.publishers.set(partition, publisher)

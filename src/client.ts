@@ -401,6 +401,7 @@ export class Client {
       creditPolicy,
       filter,
       consumerUpdateListener,
+      connectionClosedListener,
     }: DeclareSuperStreamConsumerParams,
     handle: SuperStreamConsumerFunc
   ): Promise<SuperConsumer> {
@@ -414,6 +415,7 @@ export class Client {
       creditPolicy,
       filter,
       consumerUpdateListener,
+      connectionClosedListener,
     })
   }
 
@@ -424,7 +426,7 @@ export class Client {
    * @param keyExtractor - Optional function to extract the routing key from a message (not required when routingKey sent with the message)
    */
   public async declareSuperStreamPublisher(
-    { superStream, publisherRef, routingStrategy, filter, routingCacheSize }: DeclareSuperStreamPublisherParams,
+    { superStream, publisherRef, routingStrategy, filter, routingCacheSize, connectionClosedListener }: DeclareSuperStreamPublisherParams,
     keyExtractor?: MessageKeyExtractorFunction
   ): Promise<SuperPublisher> {
     return SuperStreamPublisher.create({
@@ -435,6 +437,7 @@ export class Client {
       routingStrategy,
       filter,
       routingCacheSize,
+      connectionClosedListener,
     })
   }
 
@@ -1055,6 +1058,12 @@ export interface DeclareSuperStreamPublisherParams {
    * Least recently used entries are evicted first. Defaults to 10000.
    */
   routingCacheSize?: number
+
+  /**
+   * Called when the connection of a partition publisher closes unexpectedly.
+   * Partition publishers use their own connections, so the client-level `connection_closed` listener does not cover them.
+   */
+  connectionClosedListener?: ConnectionClosedListener
 }
 
 /**
@@ -1096,6 +1105,12 @@ export interface DeclareSuperStreamConsumerParams {
   creditPolicy?: ConsumerCreditPolicy
   filter?: ConsumerFilter
   consumerUpdateListener?: ConsumerUpdateListener
+
+  /**
+   * Called when the connection of a partition consumer closes unexpectedly.
+   * Partition consumers use their own connections, so the client-level `connection_closed` listener does not cover them.
+   */
+  connectionClosedListener?: ConnectionClosedListener
 }
 
 export interface SubscribeParams {
