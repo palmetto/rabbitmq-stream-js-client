@@ -1,4 +1,4 @@
-import { Client, ConsumerFilter } from "./client"
+import { Client, ConnectionClosedListener, ConsumerFilter } from "./client"
 import { Consumer, ConsumerUpdateListener } from "./consumer"
 import { ConsumerCreditPolicy, defaultCreditPolicy } from "./consumer_credit_policy"
 import { Message } from "./publisher"
@@ -23,6 +23,7 @@ export class SuperStreamConsumer implements SuperConsumer {
   private creditPolicy: ConsumerCreditPolicy
   private filter?: ConsumerFilter
   private consumerUpdateListener?: ConsumerUpdateListener
+  private connectionClosedListener?: ConnectionClosedListener
 
   private constructor(
     readonly handle: SuperStreamConsumerFunc,
@@ -35,6 +36,7 @@ export class SuperStreamConsumer implements SuperConsumer {
       creditPolicy?: ConsumerCreditPolicy
       filter?: ConsumerFilter
       consumerUpdateListener?: ConsumerUpdateListener
+      connectionClosedListener?: ConnectionClosedListener
     }
   ) {
     this.superStream = params.superStream
@@ -45,6 +47,7 @@ export class SuperStreamConsumer implements SuperConsumer {
     this.creditPolicy = params.creditPolicy || defaultCreditPolicy
     this.filter = params.filter
     this.consumerUpdateListener = params.consumerUpdateListener
+    this.connectionClosedListener = params.connectionClosedListener
   }
 
   async start(): Promise<void> {
@@ -57,6 +60,7 @@ export class SuperStreamConsumer implements SuperConsumer {
             offset: this.offset,
             singleActive: true,
             consumerUpdateListener: this.consumerUpdateListener,
+            connectionClosedListener: this.connectionClosedListener,
             creditPolicy: this.creditPolicy,
             filter: this.filter,
           },
@@ -85,6 +89,7 @@ export class SuperStreamConsumer implements SuperConsumer {
       creditPolicy?: ConsumerCreditPolicy
       filter?: ConsumerFilter
       consumerUpdateListener?: ConsumerUpdateListener
+      connectionClosedListener?: ConnectionClosedListener
     }
   ): Promise<SuperStreamConsumer> {
     const superStreamConsumer = new SuperStreamConsumer(handle, params)
