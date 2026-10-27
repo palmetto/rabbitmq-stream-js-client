@@ -40,6 +40,20 @@ describe("restart connections", () => {
     })
   }).timeout(10000)
 
+  it("restarting a live connection destroys the previous socket instead of leaking it", async () => {
+    const consumer = await client.declareConsumer({ stream: streamName, offset: Offset.first() }, () => undefined)
+    const locatorSocket = (client as any).locatorConnection.socket
+    const consumerSocket = (consumer as any).connection.socket
+    expect(locatorSocket.destroyed).eql(false)
+    expect(consumerSocket.destroyed).eql(false)
+
+    await client.restart()
+
+    expect(locatorSocket.destroyed).eql(true)
+    expect(consumerSocket.destroyed).eql(true)
+    expect((client as any).locatorConnection.socket).not.eql(locatorSocket)
+  }).timeout(10000)
+
   it("client with publishers and consumers, socket connections are reestablished", async () => {
     const clientOldConnectionInfo = client.getConnectionInfo()
     const streamNames = [streamName, createStreamName(), createStreamName()]
