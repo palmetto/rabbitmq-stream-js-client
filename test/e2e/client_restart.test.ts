@@ -54,6 +54,53 @@ describe("restart connections", () => {
     expect((client as any).locatorConnection.socket).not.eql(locatorSocket)
   }).timeout(10000)
 
+  it("restarting by connection id only restarts that connection and its consumers", async () => {
+    const otherStream = createStreamName()
+    await rabbit.createStream(otherStream)
+    const messages1: string[] = []
+    const messages2: string[] = []
+    const consumer1 = await client.declareConsumer({ stream: streamName, offset: Offset.next() }, (m) =>
+      messages1.push(m.content.toString())
+    )
+    const consumer2 = await client.declareConsumer({ stream: otherStream, offset: Offset.next() }, (m) =>
+      messages2.push(m.content.toString())
+    )
+    const connection1 = (consumer1 as any).connection
+    const connection2 = (consumer2 as any).connection
+    expect(connection1.connectionId).not.eql(connection2.connectionId)
+    const locatorSocket = (client as any).locatorConnection.socket
+    const socket1 = connection1.socket
+    const socket2 = connection2.socket
+
+    await client.restart([connection1.connectionId])
+
+    expect(socket1.destroyed).eql(true)
+    expect(connection1.socket).not.eql(socket1)
+    expect(socket2.destroyed).eql(false)
+    expect(connection2.socket).eql(socket2)
+    expect(locatorSocket.destroyed).eql(false)
+
+    // both consumers still receive messages
+    const publisher1 = await client.declarePublisher({ stream: streamName })
+    const publisher2 = await client.declarePublisher({ stream: otherStream })
+    await publisher1.send(Buffer.from("one"))
+    await publisher2.send(Buffer.from("two"))
+    await eventually(() => {
+      expect(messages1).eql(["one"])
+      expect(messages2).eql(["two"])
+    })
+    await rabbit.deleteStream(otherStream)
+  }).timeout(20000)
+
+  it("restarting with an unknown connection id does nothing", async () => {
+    const locatorSocket = (client as any).locatorConnection.socket
+
+    await client.restart(["no-such-connection"])
+
+    expect((client as any).locatorConnection.socket).eql(locatorSocket)
+    expect(locatorSocket.destroyed).eql(false)
+  }).timeout(10000)
+
   it("client with publishers and consumers, socket connections are reestablished", async () => {
     const clientOldConnectionInfo = client.getConnectionInfo()
     const streamNames = [streamName, createStreamName(), createStreamName()]
