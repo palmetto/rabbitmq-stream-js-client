@@ -62,8 +62,10 @@ import { StreamResponseError } from "./stream_response_error"
 
 /**
  * Callback invoked when a connection closes
+ * @param hadError - True if the connection closed due to an error
+ * @param connectionId - Id of the connection that closed; pass it to `Client.restart` to restart only that connection
  */
-export type ConnectionClosedListener = (hadError: boolean) => void
+export type ConnectionClosedListener = (hadError: boolean, connectionId: string) => void
 
 /**
  * Extended listener parameters for connections, including delivery and consumer update listeners
@@ -228,7 +230,8 @@ export class Connection {
           `Close event on socket for connection ${this.connectionId}, close cloud had_error? ${had_error}`
         )
         this.rejectWaitingResponses()
-        if (this.connectionClosedListener && !this.userManuallyClose) this.connectionClosedListener(had_error)
+        if (this.connectionClosedListener && !this.userManuallyClose)
+          this.connectionClosedListener(had_error, this.connectionId)
       })
     })
   }
