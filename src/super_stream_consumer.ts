@@ -1,12 +1,19 @@
-import { Client, ConsumerFilter } from "./client"
-import { Consumer } from "./consumer"
+import { Client, ConnectionClosedListener, ConsumerFilter } from "./client"
+import { Consumer, ConsumerUpdateListener } from "./consumer"
 import { ConsumerCreditPolicy, defaultCreditPolicy } from "./consumer_credit_policy"
 import { Message } from "./publisher"
 import { Offset } from "./requests/subscribe_request"
 
 export type SuperStreamConsumerFunc = (msg: Message, consumer: Consumer) => Promise<void> | void
 
-export class SuperStreamConsumer {
+export interface SuperConsumer {
+  close(): Promise<void>
+
+  readonly consumerRef: string
+  readonly superStream: string
+}
+
+export class SuperStreamConsumer implements SuperConsumer {
   private consumers: Map<string, Consumer> = new Map<string, Consumer>()
   public consumerRef: string
   readonly superStream: string
@@ -15,6 +22,8 @@ export class SuperStreamConsumer {
   private offset: Offset
   private creditPolicy: ConsumerCreditPolicy
   private filter?: ConsumerFilter
+  private consumerUpdateListener?: ConsumerUpdateListener
+  private connectionClosedListener?: ConnectionClosedListener
 
   private constructor(
     readonly handle: SuperStreamConsumerFunc,
@@ -26,6 +35,8 @@ export class SuperStreamConsumer {
       offset: Offset
       creditPolicy?: ConsumerCreditPolicy
       filter?: ConsumerFilter
+      consumerUpdateListener?: ConsumerUpdateListener
+      connectionClosedListener?: ConnectionClosedListener
     }
   ) {
     this.superStream = params.superStream
@@ -35,6 +46,8 @@ export class SuperStreamConsumer {
     this.offset = params.offset
     this.creditPolicy = params.creditPolicy || defaultCreditPolicy
     this.filter = params.filter
+    this.consumerUpdateListener = params.consumerUpdateListener
+    this.connectionClosedListener = params.connectionClosedListener
   }
 
   async start(): Promise<void> {
@@ -46,6 +59,8 @@ export class SuperStreamConsumer {
             consumerRef: this.consumerRef,
             offset: this.offset,
             singleActive: true,
+            consumerUpdateListener: this.consumerUpdateListener,
+            connectionClosedListener: this.connectionClosedListener,
             creditPolicy: this.creditPolicy,
             filter: this.filter,
           },
@@ -73,6 +88,8 @@ export class SuperStreamConsumer {
       offset: Offset
       creditPolicy?: ConsumerCreditPolicy
       filter?: ConsumerFilter
+      consumerUpdateListener?: ConsumerUpdateListener
+      connectionClosedListener?: ConnectionClosedListener
     }
   ): Promise<SuperStreamConsumer> {
     const superStreamConsumer = new SuperStreamConsumer(handle, params)
@@ -81,6 +98,12 @@ export class SuperStreamConsumer {
   }
 
   async close(): Promise<void> {
-    await Promise.all([...this.consumers.values()].map((c) => c.close()))
+    // closeConsumer throws for consumers the client no longer tracks (e.g. already closed by the client itself).
+    // Compare instances rather than extendedIds: ids are recycled, so a stale partition could match a replacement.
+    const registered = new Set<Consumer>(this.locator.getConsumers().map(({ consumer }) => consumer))
+    await Promise.all(
+      [...this.consumers.values()].filter((c) => registered.has(c)).map((c) => this.locator.closeConsumer(c.extendedId))
+    )
+    this.consumers.clear()
   }
 }

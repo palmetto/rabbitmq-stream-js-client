@@ -39,8 +39,8 @@ import { RouteResponse } from "./responses/route_response"
 import { StreamStatsResponse } from "./responses/stream_stats_response"
 import { SubscribeResponse } from "./responses/subscribe_response"
 import { UnsubscribeResponse } from "./responses/unsubscribe_response"
-import { SuperStreamConsumer, SuperStreamConsumerFunc } from "./super_stream_consumer"
-import { MessageKeyExtractorFunction, SuperStreamPublisher } from "./super_stream_publisher"
+import { SuperConsumer, SuperStreamConsumer, SuperStreamConsumerFunc } from "./super_stream_consumer"
+import { MessageKeyExtractorFunction, SuperPublisher, SuperStreamPublisher } from "./super_stream_publisher"
 import { DEFAULT_FRAME_MAX, REQUIRED_MANAGEMENT_VERSION, ResponseCode, sample, wait } from "./util"
 import { ConsumerCreditPolicy, CreditRequestWrapper, defaultCreditPolicy } from "./consumer_credit_policy"
 import { PublishConfirmResponse } from "./responses/publish_confirm_response"
@@ -49,8 +49,9 @@ import { PublishErrorResponse } from "./responses/publish_error_response"
 /**
  * Callback invoked when a connection is closed
  * @param hadError - True if the connection closed due to an error
+ * @param connectionId - Id of the connection that closed; pass it to `Client.restart` to restart only that connection
  */
-export type ConnectionClosedListener = (hadError: boolean) => void
+export type ConnectionClosedListener = (hadError: boolean, connectionId: string) => void
 
 /**
  * Callback invoked when a publish is confirmed by the server
@@ -349,7 +350,7 @@ export class Client {
     )
     connection.registerForCloseConsumer(consumer.extendedId, params.stream, async () => {
       if (params.connectionClosedListener) {
-        params.connectionClosedListener(false)
+        params.connectionClosedListener(false, connection.connectionId)
       }
       await this.closeConsumer(consumer.extendedId)
     })
@@ -386,9 +387,17 @@ export class Client {
    * @param handle - Message handler function that processes received messages
    */
   public async declareSuperStreamConsumer(
-    { superStream, offset, consumerRef, creditPolicy, filter }: DeclareSuperStreamConsumerParams,
+    {
+      superStream,
+      offset,
+      consumerRef,
+      creditPolicy,
+      filter,
+      consumerUpdateListener,
+      connectionClosedListener,
+    }: DeclareSuperStreamConsumerParams,
     handle: SuperStreamConsumerFunc
-  ): Promise<SuperStreamConsumer> {
+  ): Promise<SuperConsumer> {
     const partitions = await this.queryPartitions({ superStream })
     return SuperStreamConsumer.create(handle, {
       superStream,
@@ -398,6 +407,8 @@ export class Client {
       partitions,
       creditPolicy,
       filter,
+      consumerUpdateListener,
+      connectionClosedListener,
     })
   }
 
@@ -405,12 +416,19 @@ export class Client {
    * Declare a publisher for a super stream
    *
    * @param params - Super stream publisher configuration, including optional filter for server-side message filtering on each partition publisher
-   * @param keyExtractor - Function to extract the routing key from a message
+   * @param keyExtractor - Optional function to extract the routing key from a message (not required when routingKey sent with the message)
    */
   public async declareSuperStreamPublisher(
-    { superStream, publisherRef, routingStrategy, filter }: DeclareSuperStreamPublisherParams,
-    keyExtractor: MessageKeyExtractorFunction
-  ): Promise<SuperStreamPublisher> {
+    {
+      superStream,
+      publisherRef,
+      routingStrategy,
+      filter,
+      routingCacheSize,
+      connectionClosedListener,
+    }: DeclareSuperStreamPublisherParams,
+    keyExtractor?: MessageKeyExtractorFunction
+  ): Promise<SuperPublisher> {
     return SuperStreamPublisher.create({
       locator: this,
       superStream: superStream,
@@ -418,6 +436,8 @@ export class Client {
       publisherRef,
       routingStrategy,
       filter,
+      routingCacheSize,
+      connectionClosedListener,
     })
   }
 
@@ -575,18 +595,21 @@ export class Client {
   /**
    * Restart the client after a connection failure
    *
-   * This method re-establishes all connections (locator, publishers, and consumers)
-   * and re-declares all publishers and consumers. Useful for automatic reconnection
-   * after network failures.
+   * This method re-establishes connections (locator, publishers, and consumers)
+   * and re-declares the publishers and consumers that live on them. Useful for automatic
+   * reconnection after network failures.
    *
-   * @returns A promise that resolves when all connections are restarted
+   * @param connectionIds - Restart only the connections with these ids (as reported by the
+   * `connection_closed` listener) and the publishers/consumers on them. Healthy connections are left
+   * untouched. When omitted, every connection is restarted. Unknown ids are ignored.
+   * @returns A promise that resolves when the connections are restarted
    * @example
    * ```typescript
    * const client = await connect({
    *   // ...connection params
    *   listeners: {
-   *     connection_closed: (hadError) => {
-   *       client.restart()
+   *     connection_closed: (hadError, connectionId) => {
+   *       client.restart([connectionId])
    *         .then(() => console.log('Reconnected'))
    *         .catch(err => console.error('Reconnection failed', err));
    *     }
@@ -594,30 +617,42 @@ export class Client {
    * });
    * ```
    */
-  public async restart() {
-    this.logger.info(`Restarting client connection ${this.locatorConnection.connectionId}`)
-    const uniqueConnectionIds = new Set<string>()
-    uniqueConnectionIds.add(this.locatorConnection.connectionId)
+  public async restart(connectionIds?: Iterable<string>) {
+    const only = connectionIds ? new Set(connectionIds) : undefined
+    const shouldRestart = (connectionId: string) => !only || only.has(connectionId)
+
+    const consumers = [...this.consumers.values()].filter(({ connection }) => shouldRestart(connection.connectionId))
+    const publishers = [...this.publishers.values()].filter(({ connection }) => shouldRestart(connection.connectionId))
+    const restartLocator = shouldRestart(this.locatorConnection.connectionId)
+    if (!restartLocator && consumers.length === 0 && publishers.length === 0) {
+      return
+    }
+
+    const restartedConnectionIds = new Set<string>()
 
     await wait(5000)
-    await this.locatorConnection.restart()
+    if (restartLocator) {
+      this.logger.info(`Restarting client connection ${this.locatorConnection.connectionId}`)
+      await this.locatorConnection.restart()
+      restartedConnectionIds.add(this.locatorConnection.connectionId)
+    }
 
-    for (const { consumer, connection, params } of this.consumers.values()) {
-      if (!uniqueConnectionIds.has(connection.connectionId)) {
+    for (const { consumer, connection, params } of consumers) {
+      if (!restartedConnectionIds.has(connection.connectionId)) {
         this.logger.info(`Restarting consumer connection ${connection.connectionId}`)
         await connection.restart()
       }
-      uniqueConnectionIds.add(connection.connectionId)
+      restartedConnectionIds.add(connection.connectionId)
       const consumerParams = { ...params, offset: Offset.offset(consumer.getOffset()) }
       await this.declareConsumerOnConnection(consumerParams, consumer.consumerId, connection)
     }
 
-    for (const { publisher, connection, params, filter } of this.publishers.values()) {
-      if (!uniqueConnectionIds.has(connection.connectionId)) {
+    for (const { publisher, connection, params, filter } of publishers) {
+      if (!restartedConnectionIds.has(connection.connectionId)) {
         this.logger.info(`Restarting publisher connection ${connection.connectionId}`)
         await connection.restart()
       }
-      uniqueConnectionIds.add(connection.connectionId)
+      restartedConnectionIds.add(connection.connectionId)
       await this.declarePublisherOnConnection(params, publisher.publisherId, connection, filter)
     }
   }
@@ -1032,6 +1067,18 @@ export interface DeclareSuperStreamPublisherParams {
   publisherRef?: string
   routingStrategy?: RoutingStrategy
   filter?: FilterFunc
+
+  /**
+   * Maximum number of routing key -> partition entries kept in memory when using the "key" routing strategy.
+   * Least recently used entries are evicted first. Defaults to 10000.
+   */
+  routingCacheSize?: number
+
+  /**
+   * Called when the connection of a partition publisher closes unexpectedly.
+   * Partition publishers use their own connections, so the client-level `connection_closed` listener does not cover them.
+   */
+  connectionClosedListener?: ConnectionClosedListener
 }
 
 /**
@@ -1072,6 +1119,13 @@ export interface DeclareSuperStreamConsumerParams {
   offset?: Offset
   creditPolicy?: ConsumerCreditPolicy
   filter?: ConsumerFilter
+  consumerUpdateListener?: ConsumerUpdateListener
+
+  /**
+   * Called when the connection of a partition consumer closes unexpectedly.
+   * Partition consumers use their own connections, so the client-level `connection_closed` listener does not cover them.
+   */
+  connectionClosedListener?: ConnectionClosedListener
 }
 
 export interface SubscribeParams {
@@ -1143,7 +1197,7 @@ export interface QueryPartitionsParams {
  *   password: 'guest',
  *   vhost: '/',
  *   listeners: {
- *     connection_closed: (hadError) => {
+ *     connection_closed: (hadError, connId) => {
  *       console.log('Connection closed', hadError);
  *     },
  *     publish_confirm: (confirm, connId) => {
