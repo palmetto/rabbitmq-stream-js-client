@@ -33,7 +33,7 @@ export interface SuperPublisher {
   close(): Promise<void>
   send(message: Buffer, opts: SuperStreamMessageOptions): Promise<SendResult>
   basicSend(publishingId: bigint, message: Buffer, opts: SuperStreamMessageOptions): Promise<SendResult>
-  sendSubEntries(messages: MessageWithOptions[], compressionType?: CompressionType): Promise<void>
+  sendSubEntries(messages: SuperStreamMessage[], compressionType?: CompressionType): Promise<void>
   getLastPublishingId(): Promise<bigint>
 
   readonly superStream: string
