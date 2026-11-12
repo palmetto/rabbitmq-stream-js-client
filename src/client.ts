@@ -667,12 +667,18 @@ export class Client {
     for (const { consumer, connection, params } of consumers) {
       if (!restartedConnectionIds.has(connection.connectionId)) {
         this.logger.info(`Restarting consumer connection ${connection.connectionId}`)
+        this.deactivateConsumersOn(connection.connectionId)
         await connection.restart()
       }
       restartedConnectionIds.add(connection.connectionId)
       const consumerParams = { ...params, offset: Offset.offset(consumer.getOffset()) }
-      await this.declareConsumerOnConnection(consumerParams, consumer.consumerId, connection)
       if (!consumer.isSingleActive) consumer.setActive(true)
+      try {
+        await this.declareConsumerOnConnection(consumerParams, consumer.consumerId, connection)
+      } catch (e) {
+        consumer.setActive(false)
+        throw e
+      }
     }
 
     for (const { publisher, connection, params, filter } of publishers) {
