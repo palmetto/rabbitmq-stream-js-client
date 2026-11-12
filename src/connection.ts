@@ -5,6 +5,7 @@ import { inspect } from "util"
 import { Compression, CompressionType, GzipCompression, NoneCompression } from "./compression"
 import { Heartbeat } from "./heartbeat"
 import { Logger } from "./logger"
+import { SocketNotOpenError } from "./socket_not_open_error"
 import { CloseRequest } from "./requests/close_request"
 import { ExchangeCommandVersionsRequest } from "./requests/exchange_command_versions_request"
 import { OpenRequest } from "./requests/open_request"
@@ -62,8 +63,10 @@ import { StreamResponseError } from "./stream_response_error"
 
 /**
  * Callback invoked when a connection closes
+ * @param hadError - True if the connection closed due to an error
+ * @param connectionId - Id of the connection that closed; pass it to `Client.restart` to restart only that connection
  */
-export type ConnectionClosedListener = (hadError: boolean) => void
+export type ConnectionClosedListener = (hadError: boolean, connectionId: string) => void
 
 /**
  * Extended listener parameters for connections, including delivery and consumer update listeners
@@ -228,7 +231,8 @@ export class Connection {
           `Close event on socket for connection ${this.connectionId}, close cloud had_error? ${had_error}`
         )
         this.rejectWaitingResponses()
-        if (this.connectionClosedListener && !this.userManuallyClose) this.connectionClosedListener(had_error)
+        if (this.connectionClosedListener && !this.userManuallyClose)
+          this.connectionClosedListener(had_error, this.connectionId)
       })
     })
   }
@@ -246,12 +250,17 @@ export class Connection {
    *
    * This recreates the socket and re-establishes the connection including
    * the full handshake process (peer properties, auth, tuning, open).
+   * The previous socket is destroyed, so restarting a connection that is still
+   * alive does not leave an orphaned connection (and its consumers) on the broker.
    *
    * @returns A promise that resolves when the connection is restarted
    */
   public async restart() {
     this.unregisterSocketListeners()
     this.rejectWaitingResponses()
+    // Listeners are gone, so this can't trigger connectionClosedListener; the "error" listener is
+    // intentionally kept so a late socket error is not unhandled.
+    this.socket.destroy()
     this.socket = this.createSocket()
     await this.registerSocketListeners()
     this.logSocket("restarted")
@@ -519,6 +528,8 @@ export class Connection {
    *
    * @param cmd - The request to send
    * @returns A promise that resolves when the request is sent
+   * @throws {SocketNotOpenError} If the socket is not open
+   * @throws {Error} If writing to the socket fails
    */
   public send(cmd: Request): Promise<void> {
     return new Promise((res, rej) => {
@@ -538,6 +549,8 @@ export class Connection {
           }
           return res()
         })
+      } else {
+        return rej(new SocketNotOpenError(this.connectionId))
       }
     })
   }

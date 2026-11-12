@@ -1,4 +1,5 @@
 import { randomUUID } from "crypto"
+import { SocketNotOpenError } from "./socket_not_open_error"
 import { coerce, lt } from "semver"
 import { inspect } from "util"
 import { Compression, CompressionType, GzipCompression, NoneCompression } from "./compression"
@@ -39,8 +40,8 @@ import { RouteResponse } from "./responses/route_response"
 import { StreamStatsResponse } from "./responses/stream_stats_response"
 import { SubscribeResponse } from "./responses/subscribe_response"
 import { UnsubscribeResponse } from "./responses/unsubscribe_response"
-import { SuperStreamConsumer, SuperStreamConsumerFunc } from "./super_stream_consumer"
-import { MessageKeyExtractorFunction, SuperStreamPublisher } from "./super_stream_publisher"
+import { SuperConsumer, SuperStreamConsumer, SuperStreamConsumerFunc } from "./super_stream_consumer"
+import { MessageKeyExtractorFunction, SuperPublisher, SuperStreamPublisher } from "./super_stream_publisher"
 import { DEFAULT_FRAME_MAX, REQUIRED_MANAGEMENT_VERSION, ResponseCode, sample, wait } from "./util"
 import { ConsumerCreditPolicy, CreditRequestWrapper, defaultCreditPolicy } from "./consumer_credit_policy"
 import { PublishConfirmResponse } from "./responses/publish_confirm_response"
@@ -49,8 +50,9 @@ import { PublishErrorResponse } from "./responses/publish_error_response"
 /**
  * Callback invoked when a connection is closed
  * @param hadError - True if the connection closed due to an error
+ * @param connectionId - Id of the connection that closed; pass it to `Client.restart` to restart only that connection
  */
-export type ConnectionClosedListener = (hadError: boolean) => void
+export type ConnectionClosedListener = (hadError: boolean, connectionId: string) => void
 
 /**
  * Callback invoked when a publish is confirmed by the server
@@ -115,6 +117,7 @@ type DeliverData = {
 export class Client {
   public readonly id: string = randomUUID()
   private consumers = new Map<string, ConsumerMappedValue>()
+  private readonly consumersClosing = new Map<StreamConsumer, Promise<boolean>>()
   private publishers = new Map<string, PublisherMappedValue>()
   private compressions = new Map<CompressionType, Compression>()
   private locatorConnection: Connection
@@ -353,12 +356,20 @@ export class Client {
     )
     connection.registerForCloseConsumer(consumer.extendedId, params.stream, async () => {
       if (params.connectionClosedListener) {
-        params.connectionClosedListener(false)
+        params.connectionClosedListener(false, connection.connectionId)
       }
       try {
         await this.closeConsumer(consumer.extendedId)
       } catch (e) {
         this.logger.error(`Error while automatically closing consumer ${consumer.extendedId}: ${inspect(e)}`)
+      }
+    })
+    consumer.setCloseHandler(async () => {
+      // compare instances: ids are recycled, so the id may belong to another consumer by now
+      if (this.consumers.get(consumer.extendedId)?.consumer === consumer) {
+        await this.closeConsumer(consumer.extendedId)
+      } else {
+        await consumer.closeInternal()
       }
     })
     this.consumers.set(consumer.extendedId, { connection, consumer, params })
@@ -376,6 +387,16 @@ export class Client {
       throw new Error(`Consumer with id: ${extendedConsumerId} does not exist`)
     }
 
+    const inProgress = this.consumersClosing.get(activeConsumer.consumer)
+    if (inProgress) return inProgress
+    const closing = this.unsubscribeAndClose(activeConsumer, extendedConsumerId).finally(() => {
+      this.consumersClosing.delete(activeConsumer.consumer)
+    })
+    this.consumersClosing.set(activeConsumer.consumer, closing)
+    return closing
+  }
+
+  private async unsubscribeAndClose(activeConsumer: ConsumerMappedValue, extendedConsumerId: string) {
     const consumerId = extractConsumerId(extendedConsumerId)
     const { streamInfos } = await this.locatorConnection.sendAndWait<MetadataResponse>(
       new MetadataRequest({ streams: [activeConsumer.consumer.streamName] })
@@ -394,9 +415,17 @@ export class Client {
    * @param handle - Message handler function that processes received messages
    */
   public async declareSuperStreamConsumer(
-    { superStream, offset, consumerRef, creditPolicy, filter }: DeclareSuperStreamConsumerParams,
+    {
+      superStream,
+      offset,
+      consumerRef,
+      creditPolicy,
+      filter,
+      consumerUpdateListener,
+      connectionClosedListener,
+    }: DeclareSuperStreamConsumerParams,
     handle: SuperStreamConsumerFunc
-  ): Promise<SuperStreamConsumer> {
+  ): Promise<SuperConsumer> {
     const partitions = await this.queryPartitions({ superStream })
     return SuperStreamConsumer.create(handle, {
       superStream,
@@ -406,6 +435,8 @@ export class Client {
       partitions,
       creditPolicy,
       filter,
+      consumerUpdateListener,
+      connectionClosedListener,
     })
   }
 
@@ -416,9 +447,16 @@ export class Client {
    * @param keyExtractor - Optional function to extract the routing key from a message (not required when routingKey sent with the message)
    */
   public async declareSuperStreamPublisher(
-    { superStream, publisherRef, routingStrategy, filter }: DeclareSuperStreamPublisherParams,
+    {
+      superStream,
+      publisherRef,
+      routingStrategy,
+      filter,
+      routingCacheSize,
+      connectionClosedListener,
+    }: DeclareSuperStreamPublisherParams,
     keyExtractor?: MessageKeyExtractorFunction
-  ): Promise<SuperStreamPublisher> {
+  ): Promise<SuperPublisher> {
     return SuperStreamPublisher.create({
       locator: this,
       superStream: superStream,
@@ -426,6 +464,8 @@ export class Client {
       publisherRef,
       routingStrategy,
       filter,
+      routingCacheSize,
+      connectionClosedListener,
     })
   }
 
@@ -434,7 +474,7 @@ export class Client {
   }
 
   private async closeAllConsumers() {
-    await Promise.all([...this.consumers.values()].map(({ consumer }) => consumer.close()))
+    await Promise.all([...this.consumers.values()].map(({ consumer }) => consumer.closeInternal()))
     this.consumers = new Map<string, ConsumerMappedValue>()
   }
 
@@ -583,18 +623,21 @@ export class Client {
   /**
    * Restart the client after a connection failure
    *
-   * This method re-establishes all connections (locator, publishers, and consumers)
-   * and re-declares all publishers and consumers. Useful for automatic reconnection
-   * after network failures.
+   * This method re-establishes connections (locator, publishers, and consumers)
+   * and re-declares the publishers and consumers that live on them. Useful for automatic
+   * reconnection after network failures.
    *
-   * @returns A promise that resolves when all connections are restarted
+   * @param connectionIds - Restart only the connections with these ids (as reported by the
+   * `connection_closed` listener) and the publishers/consumers on them. Healthy connections are left
+   * untouched. When omitted, every connection is restarted. Unknown ids are ignored.
+   * @returns A promise that resolves when the connections are restarted
    * @example
    * ```typescript
    * const client = await connect({
    *   // ...connection params
    *   listeners: {
-   *     connection_closed: (hadError) => {
-   *       client.restart()
+   *     connection_closed: (hadError, connectionId) => {
+   *       client.restart([connectionId])
    *         .then(() => console.log('Reconnected'))
    *         .catch(err => console.error('Reconnection failed', err));
    *     }
@@ -602,30 +645,49 @@ export class Client {
    * });
    * ```
    */
-  public async restart() {
-    this.logger.info(`Restarting client connection ${this.locatorConnection.connectionId}`)
-    const uniqueConnectionIds = new Set<string>()
-    uniqueConnectionIds.add(this.locatorConnection.connectionId)
+  public async restart(connectionIds?: Iterable<string>) {
+    const only = connectionIds ? new Set(connectionIds) : undefined
+    const shouldRestart = (connectionId: string) => !only || only.has(connectionId)
 
-    await wait(5000)
-    await this.locatorConnection.restart()
-
-    for (const { consumer, connection, params } of this.consumers.values()) {
-      if (!uniqueConnectionIds.has(connection.connectionId)) {
-        this.logger.info(`Restarting consumer connection ${connection.connectionId}`)
-        await connection.restart()
-      }
-      uniqueConnectionIds.add(connection.connectionId)
-      const consumerParams = { ...params, offset: Offset.offset(consumer.getOffset()) }
-      await this.declareConsumerOnConnection(consumerParams, consumer.consumerId, connection)
+    const consumers = [...this.consumers.values()].filter(({ connection }) => shouldRestart(connection.connectionId))
+    const publishers = [...this.publishers.values()].filter(({ connection }) => shouldRestart(connection.connectionId))
+    const restartLocator = shouldRestart(this.locatorConnection.connectionId)
+    if (!restartLocator && consumers.length === 0 && publishers.length === 0) {
+      return
     }
 
-    for (const { publisher, connection, params, filter } of this.publishers.values()) {
-      if (!uniqueConnectionIds.has(connection.connectionId)) {
+    const restartedConnectionIds = new Set<string>()
+
+    await wait(5000)
+    if (restartLocator) {
+      this.logger.info(`Restarting client connection ${this.locatorConnection.connectionId}`)
+      await this.locatorConnection.restart()
+      restartedConnectionIds.add(this.locatorConnection.connectionId)
+    }
+
+    for (const { consumer, connection, params } of consumers) {
+      if (!restartedConnectionIds.has(connection.connectionId)) {
+        this.logger.info(`Restarting consumer connection ${connection.connectionId}`)
+        this.deactivateConsumersOn(connection.connectionId)
+        await connection.restart()
+      }
+      restartedConnectionIds.add(connection.connectionId)
+      const consumerParams = { ...params, offset: Offset.offset(consumer.getOffset()) }
+      if (!consumer.isSingleActive) consumer.setActive(true)
+      try {
+        await this.declareConsumerOnConnection(consumerParams, consumer.consumerId, connection)
+      } catch (e) {
+        consumer.setActive(false)
+        throw e
+      }
+    }
+
+    for (const { publisher, connection, params, filter } of publishers) {
+      if (!restartedConnectionIds.has(connection.connectionId)) {
         this.logger.info(`Restarting publisher connection ${connection.connectionId}`)
         await connection.restart()
       }
-      uniqueConnectionIds.add(connection.connectionId)
+      restartedConnectionIds.add(connection.connectionId)
       await this.declarePublisherOnConnection(params, publisher.publisherId, connection, filter)
     }
   }
@@ -724,7 +786,13 @@ export class Client {
 
   private askForCredit(subscriptionId: number, connection: Connection): CreditRequestWrapper {
     return async (howMany: number) => {
-      return connection.send(new CreditRequest({ subscriptionId: subscriptionId, credit: howMany }))
+      try {
+        await connection.send(new CreditRequest({ subscriptionId: subscriptionId, credit: howMany }))
+      } catch (e) {
+        // a delivery can still be handled after the connection is gone: there is nobody to give credit to
+        if (!(e instanceof SocketNotOpenError)) throw e
+        this.logger.debug(`Credit not requested: ${e.message}`)
+      }
     }
   }
 
@@ -781,6 +849,12 @@ export class Client {
     await consumer.creditPolicy.onChunkCompleted(creditRequestWrapper)
   }
 
+  private deactivateConsumersOn(connectionId: string) {
+    for (const { consumer, connection } of this.consumers.values()) {
+      if (connection.connectionId === connectionId) consumer.setActive(false)
+    }
+  }
+
   private getConsumerUpdateCallback(connectionId: string) {
     return async (response: ConsumerUpdateQuery) => {
       const { consumer, connection } = this.consumers.get(
@@ -793,12 +867,18 @@ export class Client {
         this.logger.error(`On consumer_update_query no consumer found`)
         return
       }
+      consumer.setActive(response.active === 1)
       const offset = await this.getConsumerOrServerSavedOffset(consumer)
       consumer.updateConsumerOffset(offset)
       this.logger.debug(`on consumer_update_query -> ${consumer.consumerRef}`)
-      await connection.send(
-        new ConsumerUpdateResponse({ correlationId: response.correlationId, responseCode: 1, offset })
-      )
+      try {
+        await connection.send(
+          new ConsumerUpdateResponse({ correlationId: response.correlationId, responseCode: 1, offset })
+        )
+      } catch (e) {
+        if (!(e instanceof SocketNotOpenError)) throw e
+        this.logger.debug(`consumer_update_query reply not sent: ${e.message}`)
+      }
     }
   }
 
@@ -877,7 +957,10 @@ export class Client {
     const connectionId = randomUUID()
     const connectionListeners = {
       ...this.params.listeners,
-      connection_closed: connectionClosedListener,
+      connection_closed: (hadError: boolean, closedConnectionId: string) => {
+        this.deactivateConsumersOn(connectionId)
+        connectionClosedListener?.(hadError, closedConnectionId)
+      },
       deliverV1: this.getDeliverV1Callback(connectionId),
       deliverV2: this.getDeliverV2Callback(connectionId),
       consumer_update_query: this.getConsumerUpdateCallback(connectionId),
@@ -931,7 +1014,7 @@ export class Client {
   }
 
   private async closing(consumer: StreamConsumer, extendedConsumerId: string) {
-    await consumer.close()
+    await consumer.closeInternal()
     this.consumers.delete(extendedConsumerId)
     this.logger.info(`Closed consumer with id: ${extendedConsumerId}`)
   }
@@ -1040,6 +1123,18 @@ export interface DeclareSuperStreamPublisherParams {
   publisherRef?: string
   routingStrategy?: RoutingStrategy
   filter?: FilterFunc
+
+  /**
+   * Maximum number of routing key -> partition entries kept in memory when using the "key" routing strategy.
+   * Least recently used entries are evicted first. Defaults to 10000.
+   */
+  routingCacheSize?: number
+
+  /**
+   * Called when the connection of a partition publisher closes unexpectedly.
+   * Partition publishers use their own connections, so the client-level `connection_closed` listener does not cover them.
+   */
+  connectionClosedListener?: ConnectionClosedListener
 }
 
 /**
@@ -1080,6 +1175,13 @@ export interface DeclareSuperStreamConsumerParams {
   offset?: Offset
   creditPolicy?: ConsumerCreditPolicy
   filter?: ConsumerFilter
+  consumerUpdateListener?: ConsumerUpdateListener
+
+  /**
+   * Called when the connection of a partition consumer closes unexpectedly.
+   * Partition consumers use their own connections, so the client-level `connection_closed` listener does not cover them.
+   */
+  connectionClosedListener?: ConnectionClosedListener
 }
 
 export interface SubscribeParams {
@@ -1151,7 +1253,7 @@ export interface QueryPartitionsParams {
  *   password: 'guest',
  *   vhost: '/',
  *   listeners: {
- *     connection_closed: (hadError) => {
+ *     connection_closed: (hadError, connId) => {
  *       console.log('Connection closed', hadError);
  *     },
  *     publish_confirm: (confirm, connId) => {

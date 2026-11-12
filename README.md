@@ -19,6 +19,7 @@
     - [Clustering](#clustering)
     - [Load Balancer](#load-balancer)
     - [Super Stream](#super-stream)
+    - [Resuming a Super Stream Consumer](#resuming-a-super-stream-consumer)
     - [Filtering](#filtering)
     - [Mitigating connection issues](#mitigating-connection-issues)
   - [Running Examples](#running-examples)
@@ -230,6 +231,24 @@ const consumer = await client.declareConsumer(consumerOptions, (message: Message
 await client.close()
 ```
 
+### Errors in a Handler
+
+A handler must not let an error escape. The client does not catch what a handler throws or rejects with: the rest of the messages in that chunk are skipped, the chunk is never completed, and the rejection is unhandled, which can end the process (Node's default for unhandled rejections). With the default credit policy (`creditsOnChunkCompleted(1, 1)`) the credit that lets the broker send the next chunk is requested only once the whole chunk has been handled, so the consumer also stops receiving messages.
+
+Handle errors inside the handler. In particular `consumer.storeOffset` rejects when the offset cannot be sent, for example after a lost connection, so catch it. Logging the failure and carrying on is usually right, as the offset of a later message covers this one.
+
+```typescript
+const consumer = await client.declareConsumer(
+  { stream: "stream-name", offset: Offset.next(), consumerRef },
+  async (message: Message) => {
+    await handle(message) // handle its own errors
+    await consumer
+      .storeOffset(message.offset)
+      .catch((error: unknown) => console.warn("Could not store the offset", error))
+  }
+)
+```
+
 ### Single Active Consumer
 
 It is possible to create a consumer as single active.
@@ -266,11 +285,13 @@ const consumerOptions = {
 // ...
 ```
 
+An error thrown by this callback is caught by the client, which logs it and starts from the offset the consumer already had, so it does not need its own try/catch.
+
 Check `example/single_active_consumer_update_example.js` for a basic usage example.
 
 ### Custom Policy
 
-By default the client uses the `creditsOnChunkCompleted(1, 1)` policy. This policy grants that messages will be processed in order, as a new chunk will only be requested once the current chunk has been processed. It is possible to override this policy by passing `creditPolicy` to the consumer options. Be aware that modifying this policy can lead to out-of-order message processing.
+By default the client uses the `creditsOnChunkCompleted(1, 1)` policy. This policy grants that messages will be processed in order, as a new chunk will only be requested once the current chunk has been processed. It is possible to override this policy by passing `creditPolicy` to the consumer options. Be aware that modifying this policy can lead to out-of-order message processing. It also changes what happens when a handler lets an error escape (see [Errors in a Handler](#errors-in-a-handler)): with `creditsOnChunkReceived` the credit is requested before the chunk is handled, so the consumer keeps receiving chunks, but the rest of the chunk the error escaped from is still skipped.
 
 ```typescript
 const consumerOptions = {
@@ -350,7 +371,7 @@ await publisher.sendSubEntries([
   { content: Buffer.from("Test message 5"), routingKey: "5" },
   { content: Buffer.from("Test message 6"), routingKey: "6" },
   { content: Buffer.from("Test message 7"), routingKey: "7" },
-]);
+])
 
 await client.declareSuperStreamConsumer({ superStream: "super-stream-example" }, (message) => {
   console.log(`Received message ${message.content.toString()}`)
@@ -359,6 +380,82 @@ await client.declareSuperStreamConsumer({ superStream: "super-stream-example" },
 await sleep(2000)
 
 await client.close()
+```
+
+### Resuming a Super Stream Consumer
+
+`resolveStartOffset` works out where a consumer should start reading. It asks the server for the offset stored under the consumer reference and returns the offset right after it. If nothing is stored yet, it returns the default offset you give it.
+
+```typescript
+resolveStartOffset(client: Client, defaultOffset: Offset, consumerRef: string, stream: string): Promise<Offset>
+```
+
+- `stream` is the name of a **partition** stream (for example `super-stream-example-0`), not the name of the super stream. Offsets are stored per partition stream.
+- A stored offset of `n` gives `Offset.offset(n + 1n)`, so the last processed message is not delivered again.
+- If the server has no stored offset for the reference (`NoOffset`), `defaultOffset` is returned.
+- Any other error is rethrown.
+
+Do not call it before declaring the consumer. Pass it to the `consumerUpdateListener` parameter of `declareSuperStreamConsumer`. The listener is called for every partition, when that partition's consumer becomes active, with the consumer reference and the partition stream name, so each partition resumes from its own stored offset.
+
+```typescript
+const consumerRef = "my-consumer"
+
+await client.declareSuperStreamConsumer(
+  {
+    superStream: "super-stream-example",
+    consumerRef,
+    consumerUpdateListener: (ref, partition) => resolveStartOffset(client, Offset.first(), ref, partition),
+  },
+  async (message, consumer) => {
+    console.log(`Received message ${message.content.toString()}`)
+    // makes the next run resume after this message. A failed store must not escape the handler
+    await consumer
+      .storeOffset(message.offset)
+      .catch((error: unknown) => console.warn("Could not store the offset", error))
+  }
+)
+```
+
+Notes:
+
+- Offsets are only stored if the consumer calls `storeOffset`, and the `consumerRef` must be the same between runs.
+- Super stream consumers are single active consumers, which is why the listener is called when a partition's consumer becomes active.
+
+A runnable version is in `example/src/superstream_resume_example.js`.
+
+### Consumer Active Status
+
+The broker can give a stream to another consumer with the same `consumerRef` while this consumer is still handling a message: when a consumer joins a super stream consumer group the broker spreads the partitions across the group, and when a connection is lost the broker hands over what it consumed.
+
+- `consumer.isActive()` is true when:
+  - a consumer is not a single active consumer, or
+  - the broker has assigned the stream to the consumer
+- `consumer.isActive()` is false when:
+  - the broker gave the stream to another consumer, or
+  - the connection was lost, or
+  - the consumer is closed
+- A consumer can be reactivated when:
+  - the broker re-assigns this consumer, or
+  - after a `client.restart()`
+- `consumer.deactivatedSignal` is an `AbortSignal` that aborts when the consumer is deactivated. A new one is created when the consumer becomes active later, so a signal read earlier stays aborted. A handler should read it once per message and check it during retries and before storing the offset.
+- The library only reports this. It does not stop an inactive consumer from handling messages or storing offsets, and it does not interrupt a handler that is already running. Checking is up to the handler: an inactive consumer that stores an offset can overwrite the offset stored by the consumer that took over.
+- A handler must not let an error escape, including a failed `storeOffset`: see [Errors in a Handler](#errors-in-a-handler).
+
+```typescript
+await client.declareSuperStreamConsumer(
+  { superStream: "super-stream-example", consumerRef },
+  async (message, consumer) => {
+    const signal = consumer.deactivatedSignal // for the whole time this message is handled
+    while (!(await tryToHandle(message))) {
+      await sleep(1000)
+      if (signal.aborted) return // another consumer has the partition: it handles this message now
+    }
+    if (signal.aborted) return // do not overwrite the offset of the consumer that took over
+    await consumer.storeOffset(message.offset).catch((error: unknown) => {
+      console.warn("Could not store the offset", error) // the offset of a later message covers this one
+    })
+  }
+)
 ```
 
 ### Filtering
