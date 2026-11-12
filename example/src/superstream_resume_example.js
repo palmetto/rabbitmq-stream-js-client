@@ -24,7 +24,7 @@ async function consumeFromStoredOffsets(client, superStream, consumerRef, label)
     },
     async (message, partitionConsumer) => {
       received.push(message.content.toString())
-      await partitionConsumer.storeOffset(message.offset)
+      await partitionConsumer.storeOffset(message.offset).catch((e) => console.warn("Could not store the offset", e)) // a failed store must not escape the handler
     }
   )
   await sleep(1000)
