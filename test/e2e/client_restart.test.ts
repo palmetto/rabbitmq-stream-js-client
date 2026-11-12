@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any -- tests inspect private connection/socket fields */
 import { expect } from "chai"
 import { Client, Offset } from "../../src"
 import { createClient, createStreamName } from "../support/fake_data"
@@ -59,12 +60,12 @@ describe("restart connections", () => {
     await rabbit.createStream(otherStream)
     const messages1: string[] = []
     const messages2: string[] = []
-    const consumer1 = await client.declareConsumer({ stream: streamName, offset: Offset.next() }, (m) =>
+    const consumer1 = await client.declareConsumer({ stream: streamName, offset: Offset.next() }, (m) => {
       messages1.push(m.content.toString())
-    )
-    const consumer2 = await client.declareConsumer({ stream: otherStream, offset: Offset.next() }, (m) =>
+    })
+    const consumer2 = await client.declareConsumer({ stream: otherStream, offset: Offset.next() }, (m) => {
       messages2.push(m.content.toString())
-    )
+    })
     const connection1 = (consumer1 as any).connection
     const connection2 = (consumer2 as any).connection
     expect(connection1.connectionId).not.eql(connection2.connectionId)
